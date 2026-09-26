@@ -4250,6 +4250,37 @@ def _table_structure(db_path):
     return tables, indexes
 
 
+def _legacy_db_with_missing_audit_trigger(db_path):
+    """构造 v1–v6 结构齐备、唯独缺少 update 审计触发器的既有库（无迁移历史表）。
+
+    直接重放迁移链 DDL（跳过 trg_display_names_audit_update 一条），模拟
+    「name_events 表已在、display_names 审计触发器不全」的接管现场。
+    """
+    import sqlite3
+
+    with sqlite3.connect(db_path) as legacy:
+        for migration in database.MIGRATIONS:
+            for statement in migration.statements:
+                if "trg_display_names_audit_update" in statement:
+                    continue
+                legacy.execute(statement)
+        legacy.execute(
+            "INSERT INTO display_names (namespace, original_name, normalized_name) "
+            "VALUES ('chat', 'Alice', 'alice')"
+        )
+        legacy.commit()
+
+
+def _audit_trigger_statement(trigger_name):
+    """从迁移链中取出指定审计触发器的 CREATE TRIGGER 语句（用于补回触发器）。"""
+    return next(
+        statement
+        for migration in database.MIGRATIONS
+        for statement in migration.statements
+        if trigger_name in statement
+    )
+
+
 def test_migrate_fresh_database_records_all_versions(tmp_path):
     """空库从头迁移：schema_migrations 记录全部版本（名称/校验和/applied_at）。"""
     db_path = tmp_path / "fresh.db"
@@ -4361,6 +4392,93 @@ def test_migrate_fails_on_unknown_recorded_version(tmp_path):
     with pytest.raises(database.MigrationError) as exc_info:
         database.init_db(str(db_path))
     assert "99" in str(exc_info.value)
+
+
+def test_migrate_legacy_takeover_fails_when_audit_trigger_missing(tmp_path):
+    """旧库已有 name_events 表但缺审计触发器：建基线拒绝把 v6 记为已应用。
+
+    抛出指明缺失触发器的 MigrationError，基线事务整体回滚、不留任何部分
+    记录；补齐触发器后同一数据库可正常完成接管（完整旧库仍可迁移）。
+    """
+    db_path = tmp_path / "legacy-missing-trigger.db"
+    _legacy_db_with_missing_audit_trigger(db_path)
+
+    with pytest.raises(database.MigrationError) as exc_info:
+        database.migrate(str(db_path))
+    message = str(exc_info.value)
+    assert "trg_display_names_audit_update" in message  # 指明缺失对象
+    assert "create_name_events" in message
+
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        # 建基线事务整体回滚：schema_migrations 不留下任何部分记录
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations"
+        ).fetchone() == (0,)
+        # 既有业务数据未被改动
+        assert conn.execute(
+            "SELECT namespace, original_name FROM display_names"
+        ).fetchall() == [("chat", "Alice")]
+
+    # 补齐缺失的触发器后：完整旧库正常接管，v6 随基线记为已应用
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(_audit_trigger_statement("trg_display_names_audit_update"))
+        conn.commit()
+    assert database.migrate(str(db_path)) == []  # 全部效果已存在，只建基线
+
+    with sqlite3.connect(db_path) as conn:
+        versions = [
+            row[0]
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        assert versions == [1, 2, 3, 4, 5, 6]
+        # 触发器齐备：新变更由触发器正常记录事件
+        # （insert 为构造旧库时落入的 Alice 一行，update 为本次改名）
+        conn.execute(
+            "UPDATE display_names SET original_name = 'Alicia', "
+            "normalized_name = 'alicia', revision = revision + 1 WHERE id = 1"
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT action FROM name_events ORDER BY id"
+        ).fetchall() == [("insert",), ("update",)]
+
+
+def test_migrate_fails_when_audit_trigger_dropped_after_migration(tmp_path):
+    """迁移完成后审计触发器被移除：启动校验拒绝，并指明缺失的触发器。
+
+    迁移历史记录本身完好（非校验和 / 缺口问题），是结构核验失败；
+    历史记录不被改写，补回触发器后恢复正常启动。
+    """
+    db_path = tmp_path / "dropped-trigger.db"
+    database.migrate(str(db_path))
+
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TRIGGER trg_display_names_audit_delete")
+        conn.commit()
+
+    with pytest.raises(database.MigrationError) as exc_info:
+        database.init_db(str(db_path))
+    message = str(exc_info.value)
+    assert "trg_display_names_audit_delete" in message  # 指明缺失对象
+    assert "create_name_events" in message
+
+    with sqlite3.connect(db_path) as conn:
+        # 历史记录保持完好：失败只源于结构核验，迁移历史未被改写
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations"
+        ).fetchone() == (6,)
+
+    # 补回触发器后恢复可启动（幂等，无待应用迁移）
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(_audit_trigger_statement("trg_display_names_audit_delete"))
+        conn.commit()
+    assert database.migrate(str(db_path)) == []
 
 
 def test_migration_status_is_read_only_and_reports_issues(tmp_path):

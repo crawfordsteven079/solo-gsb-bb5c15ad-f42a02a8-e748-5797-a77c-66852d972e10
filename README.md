@@ -40,8 +40,8 @@ docker compose up --build
 该命令完成镜像构建、依赖安装、**版本化数据库迁移**与 API 启动：容器启动时先执行
 `python -m app.database migrate`（按递增版本逐个原子提交，多实例并发启动安全；
 首次接管老版本数据库自动建立基线，详见下文「数据库迁移」），迁移成功后才启动
-uvicorn；迁移校验失败（迁移文件被改写 / 版本缺口）时容器以非零码退出，API 不会
-带病启动。SQLite 文件落在命名卷 `names-data` 中。容器启动后即可直接使用全部接口
+uvicorn；迁移校验失败（迁移文件被改写 / 版本缺口 / 审计触发器缺失）时容器以
+非零码退出，API 不会带病启动。SQLite 文件落在命名卷 `names-data` 中。容器启动后即可直接使用全部接口
 （含 `PUT/GET /namespaces/{namespace}/script-policy`、`POST /namespaces/{source}/merge`、
 `DELETE /namespaces/{namespace}/names/{id}` 释放冷却、`POST /name-risk-clusters`
 跨空间同形风险簇、`POST /namespaces/{namespace}/snapshot-proof` 快照 Merkle
@@ -74,6 +74,13 @@ python -m app.database status    # 只读输出已应用 / 待应用 / 校验异
   应用启动失败、不继续服务。`status` 为纯只读（不建表、不建基线、不执行
   迁移），以 JSON 返回 `applied` / `pending` / `issues`（`checksum_mismatch`、
   `unknown_version`、`version_gap`），可随时安全执行。
+- **审计触发器结构核实**：凡 v6（`create_name_events`）被视为已应用（已记录
+  或首次接管的基线判定），启动迁移还会核实 `display_names` 上 INSERT /
+  UPDATE / DELETE 三个审计触发器完整存在。旧库只有 `name_events` 表而缺
+  触发器、或迁移完成后触发器被移除时，`migrate` 抛出指明缺失触发器的
+  `MigrationError` 并以非零码退出（首次接管的基线事务整体回滚，不留部分
+  记录）——否则注册 / 改名 / 释放会静默漏记变更事件。按 v6 的触发器定义
+  补齐缺失触发器后即可正常启动。
 
 ## 本地开发（单条命令）
 

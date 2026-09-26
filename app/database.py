@@ -46,6 +46,11 @@ old_*，delete 无 new_*）。注册、预占确认、改名、交换（含事�
 - 已记录迁移对应的迁移文件被改写（校验和不匹配）、记录了未知版本或版本
   历史出现缺口时，migrate 抛出 MigrationError 并指明具体版本号，应用
   启动失败、不继续服务。
+- 审计流水迁移（v6）另有结构核实：凡其被视为已应用（已记录或首次接管
+  的基线判定），都要求 display_names 上 INSERT / UPDATE / DELETE 三个
+  审计触发器完整存在。旧库只有 name_events 表而缺触发器、或迁移完成后
+  触发器被移除时，抛出指明缺失触发器的 MigrationError（首次接管的基线
+  事务整体回滚，不留部分记录）——否则注册 / 改名 / 释放会静默漏记事件。
 
 命令行：
     python -m app.database migrate   # 执行全部待应用迁移（幂等）
@@ -276,6 +281,18 @@ assert [m.version for m in MIGRATIONS] == list(range(1, len(MIGRATIONS) + 1)), (
     "MIGRATIONS 版本号必须从 1 开始连续递增"
 )
 
+# 审计流水迁移（create_name_events）的版本号，及其必须在 display_names 上
+# 建立的三个审计触发器。name_events 表存在并不代表审计链路完整：旧库可能
+# 只建了表而缺触发器，或迁移完成后触发器被移除——此时注册 / 改名 / 释放会
+# 静默漏记事件，因此凡 v6 被视为已应用（已记录或基线判定），启动迁移都要
+# 核实这些触发器存在且确实挂在 display_names 上。
+_NAME_EVENTS_VERSION = 6
+_AUDIT_TRIGGERS: tuple[str, ...] = (
+    "trg_display_names_audit_insert",
+    "trg_display_names_audit_update",
+    "trg_display_names_audit_delete",
+)
+
 
 class MigrationError(RuntimeError):
     """迁移校验或执行失败：错误信息指明具体版本号，应用必须中止启动。"""
@@ -315,6 +332,42 @@ def _detect_legacy_applied(conn: sqlite3.Connection) -> set[int]:
     if "name_events" in tables:
         applied.add(6)
     return applied
+
+
+def _missing_audit_triggers(conn: sqlite3.Connection) -> list[str]:
+    """列出缺失的 display_names 审计触发器名（空列表表示三类触发器完整）。
+
+    以 sqlite_master 中 type='trigger' 且 tbl_name='display_names' 判定
+    “触发器存在且确实挂在 display_names 上”（同名触发器挂在别的表不算）。
+    """
+    present = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type = 'trigger' AND tbl_name = 'display_names'"
+        )
+    }
+    return [name for name in _AUDIT_TRIGGERS if name not in present]
+
+
+def _validate_audit_triggers(conn: sqlite3.Connection, applied: set[int]) -> None:
+    """v6 被视为已应用（已记录或基线判定）时，核实审计触发器完整。
+
+    INSERT / UPDATE / DELETE 任一触发器缺失（旧库只建了 name_events 表、
+    或迁移完成后触发器被移除）都会让注册 / 改名 / 释放静默漏记变更事件，
+    因此抛出指明缺失触发器的 MigrationError，拒绝启动。
+    """
+    if _NAME_EVENTS_VERSION not in applied:
+        return
+    missing = _missing_audit_triggers(conn)
+    if missing:
+        migration = _MIGRATIONS_BY_VERSION[_NAME_EVENTS_VERSION]
+        raise MigrationError(
+            f"迁移版本 {migration.version}（{migration.name}）已被视为已应用"
+            f"（迁移记录或基线判定），但 display_names 审计触发器缺失："
+            f"{', '.join(missing)}；注册 / 改名 / 释放的变更事件会静默漏记，"
+            "拒绝启动。请按该迁移的触发器定义补齐缺失触发器后重试"
+        )
 
 
 def _read_recorded(conn: sqlite3.Connection) -> dict[int, sqlite3.Row]:
@@ -372,7 +425,9 @@ def _baseline_if_first_takeover(conn: sqlite3.Connection) -> bool:
 
     整个判定与写入在单个 BEGIN IMMEDIATE 事务内完成：并发进程同时首次接管
     同一数据库时，后到者在持锁重读后看到基线已存在，直接跳过不重复写入
-    （其后的逐迁移应用会校验这些记录的校验和）。
+    （其后的逐迁移应用会校验这些记录的校验和）。基线把 v6 记为已应用之前
+    会先核实 display_names 审计触发器完整；缺失时抛 MigrationError 并整体
+    回滚，不留下部分基线记录。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -381,7 +436,10 @@ def _baseline_if_first_takeover(conn: sqlite3.Connection) -> bool:
             # 并发进程已抢先建立基线：本事务不再写入
             conn.commit()
             return False
-        for version in sorted(_detect_legacy_applied(conn)):
+        detected = _detect_legacy_applied(conn)
+        # 旧库可能已有 name_events 表却缺审计触发器：v6 不能记为已应用
+        _validate_audit_triggers(conn, detected)
+        for version in sorted(detected):
             migration = _MIGRATIONS_BY_VERSION[version]
             conn.execute(
                 "INSERT INTO schema_migrations (version, name, checksum) "
@@ -398,14 +456,16 @@ def _baseline_if_first_takeover(conn: sqlite3.Connection) -> bool:
 def _apply_one(conn: sqlite3.Connection, migration: Migration) -> bool:
     """在单个 BEGIN IMMEDIATE 事务内应用一个迁移；已被并发应用则跳过。
 
-    持写锁后重新读取已记录版本并校验（防改写 / 防未知版本），该迁移已记录
-    则直接提交返回；否则在同一事务内执行全部迁移语句并写入历史记录后原子
-    提交。任一语句失败整体回滚，不会留下半个迁移。
+    持写锁后重新读取已记录版本并校验（防改写 / 防未知版本；已记录 v6 时
+    一并核实审计触发器完整），该迁移已记录则直接提交返回；否则在同一事务
+    内执行全部迁移语句并写入历史记录后原子提交。任一语句失败整体回滚，
+    不会留下半个迁移。
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
         recorded = _read_recorded(conn)
         _validate_recorded(recorded, check_gaps=False)
+        _validate_audit_triggers(conn, set(recorded))
         if migration.version in recorded:
             conn.commit()
             return False
@@ -429,7 +489,9 @@ def migrate(path: str | None = None) -> list[int]:
     首次接管既有数据库时先按表/列状态建立基线；空库从头执行全部迁移。
     每个迁移在独立的 BEGIN IMMEDIATE 事务中原子提交，并发启动的多个进程
     不会重复执行同一迁移。迁移文件被改写、出现未知版本或版本缺口时抛出
-    MigrationError（含具体版本号），调用方应中止启动。
+    MigrationError（含具体版本号），调用方应中止启动。v6 被视为已应用
+    （已记录或基线判定）时还会核实 display_names 审计触发器完整，缺失
+    同样抛出 MigrationError（指明缺失的触发器）。
     """
     target = path or DATABASE_PATH
     if target != ":memory:":
@@ -442,12 +504,14 @@ def migrate(path: str | None = None) -> list[int]:
     try:
         _ensure_migrations_table(conn)
         # 已有迁移历史（非首次接管）：先在 BEGIN IMMEDIATE 中重读并严格校验
-        # （迁移文件被改写 / 未知版本 / 版本缺口 -> MigrationError，拒绝启动）
+        # （迁移文件被改写 / 未知版本 / 版本缺口 -> MigrationError，拒绝启动）；
+        # 已记录 v6 时一并核实审计触发器仍在（迁移后被移除会静默漏记事件）
         conn.execute("BEGIN IMMEDIATE")
         try:
             recorded = _read_recorded(conn)
             if recorded:
                 _validate_recorded(recorded, check_gaps=True)
+                _validate_audit_triggers(conn, set(recorded))
             conn.commit()
         except BaseException:
             conn.rollback()

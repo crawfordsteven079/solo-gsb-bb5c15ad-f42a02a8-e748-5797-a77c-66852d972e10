@@ -4876,3 +4876,140 @@ def test_migrate_to_v6_does_not_backfill_events_for_existing_rows(tmp_path):
             "old_revision, new_revision FROM name_events"
         ).fetchall()
         assert rows == [("update", "Alice", "Alicia", 1, 2)]
+
+
+def _legacy_db_with_events_table_missing_trigger(db_path):
+    """构造 v1–v6 形态但缺 DELETE 审计触发器的既有库（v6 未完整生效）。
+
+    name_events 表、索引与 INSERT / UPDATE 触发器都在（模拟旧库历史上只
+    建了表，或触发器后来被移除），唯独缺 display_names 的 DELETE 审计
+    触发器：首次接管不得把 v6 记为已应用。
+    """
+    import sqlite3
+
+    with sqlite3.connect(db_path) as legacy:
+        for migration in database.MIGRATIONS:
+            if migration.version == 6:
+                # 存量数据先于 name_events 存在（不为它留下历史事件）
+                legacy.execute(
+                    "INSERT INTO display_names "
+                    "(namespace, original_name, normalized_name) "
+                    "VALUES ('chat', 'Alice', 'alice')"
+                )
+            for statement in migration.statements:
+                if "trg_display_names_audit_delete" in statement:
+                    continue  # 刻意不建 DELETE 触发器
+                legacy.execute(statement)
+        legacy.commit()
+
+
+def _v6_trigger_statement(trigger_name):
+    """从迁移 v6 的语句组中取出指定审计触发器的 CREATE TRIGGER 语句。"""
+    return next(
+        statement
+        for statement in database._MIGRATIONS_BY_VERSION[6].statements
+        if trigger_name in statement
+    )
+
+
+def test_migrate_fails_when_legacy_db_missing_audit_trigger(tmp_path):
+    """旧库已有 name_events 表却缺审计触发器：首次接管拒绝把 v6 记为已应用。
+
+    建基线事务整体回滚（不留部分记录）；补齐触发器后完整旧库可正常接管。
+    """
+    db_path = tmp_path / "legacy-missing-trigger.db"
+    _legacy_db_with_events_table_missing_trigger(db_path)
+
+    with pytest.raises(database.MigrationError) as exc_info:
+        database.init_db(str(db_path))
+    message = str(exc_info.value)
+    assert "trg_display_names_audit_delete" in message  # 指明缺失对象
+    assert "create_name_events" in message
+
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        # 建基线事务整体回滚：不留下任何部分基线记录
+        assert conn.execute(
+            "SELECT COUNT(*) FROM schema_migrations"
+        ).fetchone() == (0,)
+        # 数据库结构未被改动：既有的两个触发器仍在，缺失的未被补建
+        triggers = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'trigger'"
+            )
+        }
+        assert triggers == {
+            "trg_display_names_audit_insert",
+            "trg_display_names_audit_update",
+        }
+
+    # 补齐缺失触发器后，完整旧库可正常接管：v6 记入基线，无待应用迁移
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(_v6_trigger_statement("trg_display_names_audit_delete"))
+        conn.commit()
+    assert database.migrate(str(db_path)) == []
+
+    with sqlite3.connect(db_path) as conn:
+        versions = [
+            row[0]
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        assert versions == [1, 2, 3, 4, 5, 6]
+        # 审计链路恢复：释放名称的删除变更正常记录事件
+        conn.execute("DELETE FROM display_names WHERE id = 1")
+        conn.commit()
+        assert conn.execute(
+            "SELECT action, old_original_name FROM name_events"
+        ).fetchall() == [("delete", "Alice")]
+
+
+def test_migrate_fails_when_audit_trigger_dropped_after_migration(tmp_path):
+    """迁移完成后审计触发器被移除：启动校验拒绝继续并指明缺失触发器。"""
+    db_path = tmp_path / "dropped-trigger.db"
+    assert database.migrate(str(db_path)) == [1, 2, 3, 4, 5, 6]
+
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("DROP TRIGGER trg_display_names_audit_update")
+        conn.commit()
+
+    with pytest.raises(database.MigrationError) as exc_info:
+        database.init_db(str(db_path))
+    message = str(exc_info.value)
+    assert "trg_display_names_audit_update" in message  # 指明缺失对象
+    assert "create_name_events" in message
+
+    # 迁移历史记录本身未被改动
+    with sqlite3.connect(db_path) as conn:
+        versions = [
+            row[0]
+            for row in conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            )
+        ]
+        assert versions == [1, 2, 3, 4, 5, 6]
+
+    # 补回触发器后恢复可启动，且改名重新正常记录事件
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(_v6_trigger_statement("trg_display_names_audit_update"))
+        conn.execute(
+            "INSERT INTO display_names (namespace, original_name, normalized_name) "
+            "VALUES ('chat', 'Alice', 'alice')"
+        )
+        conn.commit()
+    assert database.migrate(str(db_path)) == []
+
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE display_names SET original_name = 'Alicia', "
+            "normalized_name = 'alicia', revision = revision + 1 WHERE id = 1"
+        )
+        conn.commit()
+        assert conn.execute(
+            "SELECT action FROM name_events ORDER BY id"
+        ).fetchall() == [("insert",), ("update",)]

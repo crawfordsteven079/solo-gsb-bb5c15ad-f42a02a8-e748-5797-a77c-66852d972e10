@@ -60,7 +60,8 @@ from .schemas import (
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 启动时执行版本化数据库迁移（幂等；迁移被改写 / 版本缺口时抛错，应用不启动）
+    # 启动时执行版本化数据库迁移（幂等；迁移被改写 / 版本缺口 / 审计触发器
+    # 缺失时抛错，应用不启动）
     database.init_db()
     yield
 

@@ -21,6 +21,6 @@ USER appuser
 
 EXPOSE 8000
 
-# 启动命令：先执行版本化数据库迁移（幂等，多实例并发启动安全；
-# 迁移被改写 / 版本缺口时以非零码退出，API 不会启动），成功后才启动 API
+# 启动命令：先执行版本化数据库迁移（幂等，多实例并发启动安全；迁移被改写 /
+# 版本缺口 / 审计触发器缺失时以非零码退出，API 不会启动），成功后才启动 API
 CMD ["sh", "-c", "python -m app.database migrate && exec uvicorn app.main:app --host 0.0.0.0 --port 8000"]
